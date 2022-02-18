@@ -29,10 +29,22 @@ import redis.clients.jedis.resps.*;
 import redis.clients.jedis.util.JedisURIHelper;
 import redis.clients.jedis.util.Pool;
 
+import static redis.clients.jedis.FpgaProtocol.*;
+import static redis.clients.jedis.FpgaProtocol.FpgaCommand.*;
+import redis.clients.jedis.util.JedisClusterCRC16;
+import redis.clients.jedis.util.SafeEncoder;
+import java.util.AbstractMap;
+import java.util.Arrays;
+import java.util.AbstractMap.SimpleEntry;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, JedisBinaryCommands,
     ControlCommands, ControlBinaryCommands, ClusterCommands, ModuleCommands, GenericControlCommands,
     SentinelCommands, Closeable {
 
+  private static final Logger logger =
+      LoggerFactory.getLogger(FpgaProtocol.class);
   protected final Connection connection;
   private final CommandObjects commandObjects = new CommandObjects();
   private int db = 0;
@@ -377,7 +389,19 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
   @Override
   public String set(final byte[] key, final byte[] value) {
     checkIsInMultiOrPipeline();
-    return connection.executeCommand(commandObjects.set(key, value));
+    String ret = connection.executeCommand(commandObjects.set(key, value));
+	if (ret.equals("OK"))
+	{
+	  int fpga_idx = setFpga(key, value);
+	  if (fpga_idx >= 0) {
+	    byte[] ret_fpga = connection.getFpgaBinaryBulkReply(fpga_idx);
+		if (!Arrays.equals(ret_fpga, FpgaProtocol.FPGA_SET_SUCCESS)){
+			logger.debug("setFpga FAILED, return {}", FpgaProtocol.toHexString(ret_fpga));
+		}
+		// Set returns magic number, nothing needs to be done.
+	  }
+	}
+	return ret;
   }
 
   /**
@@ -406,6 +430,13 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
   @Override
   public byte[] get(final byte[] key) {
     checkIsInMultiOrPipeline();
+	int fpga_idx = getFpga(key);
+	if (fpga_idx >= 0) {
+		byte[] ret_fpga = connection.getFpgaBinaryBulkReply(fpga_idx);
+		if (ret_fpga != null) {
+			return ret_fpga;
+		}
+	}
     return connection.executeCommand(commandObjects.get(key));
   }
 
@@ -4810,7 +4841,19 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
   @Override
   public String set(final String key, final String value) {
     checkIsInMultiOrPipeline();
-    return connection.executeCommand(commandObjects.set(key, value));
+    String ret = connection.executeCommand(commandObjects.set(key, value));
+	if (ret.equals("OK"))
+	{
+	  int fpga_idx = setFpga(key, value);
+	  if (fpga_idx >= 0) {
+	    byte[] ret_fpga = connection.getFpgaBinaryBulkReply(fpga_idx);
+		if (ret_fpga == null) {
+			logger.debug("fpga set failed");
+		}
+		// Set returns magic number, nothing needs to be done.
+	  }
+	}
+	return ret;
   }
 
   /**
@@ -4840,6 +4883,13 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
   @Override
   public String get(final String key) {
     checkIsInMultiOrPipeline();
+	int fpga_idx = getFpga(key);
+	if (fpga_idx >= 0) {
+		String ret_fpga = connection.getFpgaBulkReply(fpga_idx);
+		if (ret_fpga != null) {
+			return ret_fpga;
+		}
+	}
     return connection.executeCommand(commandObjects.get(key));
   }
 
@@ -6290,7 +6340,7 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
    * @param key
    * @param count if positive, return an array of distinct elements.
    *        If negative the behavior changes and the command is allowed to
-   *        return the same element multiple times  
+   *        return the same element multiple times
    * @return A list of randomly selected elements
    */
   @Override
@@ -9134,6 +9184,54 @@ public class Jedis implements ServerCommands, DatabaseCommands, JedisCommands, J
     result[1] = second;
     System.arraycopy(rest, 0, result, 2, rest.length);
     return result;
+  }
+
+  public static void addFpgas(List<Entry<String, Integer>> fpgas) {
+	FpgaProtocol.FPGA_ADDRS.addAll(fpgas);
+  }
+  public static void addFpga(Entry<String, Integer> fpga) {
+	FpgaProtocol.FPGA_ADDRS.add(fpga);
+  }
+  public static void addNoCache() {
+	FpgaProtocol.FPGA_ADDRS.add(new AbstractMap.SimpleEntry("cpu",0));
+  }
+
+  public static void setFpgaTimeout(long timeout) {
+	FpgaProtocol.timeoutNano = timeout;
+  }
+  public static long getFpgaNoResp() {
+	return FpgaProtocol.noResp;
+  }
+  public static long getFpgaFallback() {
+	return FpgaProtocol.fallback;
+  }
+
+  public int getFpga(final byte[] key) {
+	if (FpgaProtocol.FPGA_ADDRS.size() <= 0)
+		return -1;
+    int fpga_idx = JedisClusterCRC16.getSlot(key) % FpgaProtocol.FPGA_ADDRS.size();
+	if (FpgaProtocol.FPGA_ADDRS.get(fpga_idx).getKey().equals("cpu"))
+		return -1;
+    connection.sendFpgaCommand(fpga_idx, FPGA_GET, key);
+    return fpga_idx;
+  }
+
+  public int getFpga(final String key) {
+    return getFpga(SafeEncoder.encode(key));
+  }
+
+  public int setFpga(final byte[] key, final byte[] value) {
+	if (FpgaProtocol.FPGA_ADDRS.size() <= 0)
+		return -1;
+    int fpga_idx = JedisClusterCRC16.getSlot(key) % FpgaProtocol.FPGA_ADDRS.size();
+    if (FpgaProtocol.FPGA_ADDRS.get(fpga_idx).getKey().equals("cpu"))
+		return -1;
+	connection.sendFpgaCommand(fpga_idx, FPGA_SET, key, value);
+    return fpga_idx;
+  }
+
+  public int setFpga(final String key, final String value) {
+    return setFpga(SafeEncoder.encode(key), SafeEncoder.encode(value));
   }
 
 }

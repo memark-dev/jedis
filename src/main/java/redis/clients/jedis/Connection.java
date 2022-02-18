@@ -4,8 +4,13 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.net.Socket;
 import java.net.SocketException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
 
 import redis.clients.jedis.args.Rawable;
 import redis.clients.jedis.commands.ProtocolCommand;
@@ -16,6 +21,8 @@ import redis.clients.jedis.util.IOUtils;
 import redis.clients.jedis.util.RedisInputStream;
 import redis.clients.jedis.util.RedisOutputStream;
 import redis.clients.jedis.util.SafeEncoder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 public class Connection implements Closeable {
 
@@ -27,6 +34,9 @@ public class Connection implements Closeable {
   private int soTimeout = 0;
   private int infiniteSoTimeout = 0;
   private boolean broken = false;
+
+  private static final Logger logger = LoggerFactory.getLogger(Connection.class);
+  private ArrayList<DatagramSocket> fpgaSockets;
 
   public Connection() {
     this(Protocol.DEFAULT_HOST, Protocol.DEFAULT_PORT);
@@ -194,6 +204,24 @@ public class Connection implements Closeable {
         }
       }
     }
+	if (!isFpgaConnected()) {
+		logger.debug("Init FPGA sockets");
+		try {
+		  fpgaSockets = new ArrayList<DatagramSocket>();
+		  logger.debug("Number of FPGAs = {}", FpgaProtocol.FPGA_ADDRS.size());
+		  if (FpgaProtocol.FPGA_ADDRS.size() > 0)
+		  {
+			  for (int i = 0; i < FpgaProtocol.FPGA_ADDRS.size(); i++) {
+				  DatagramSocket socketFpga = new DatagramSocket();
+				  fpgaSockets.add(socketFpga);
+			  }
+		  } else {
+			  logger.debug("FPGA not present, use CPU redis server only.");
+		  }
+		} catch (Exception e) {
+		  logger.warn("fpgaSockets open failed");
+		}
+	}
   }
 
   @Override
@@ -223,6 +251,14 @@ public class Connection implements Closeable {
         IOUtils.closeQuietly(socket);
       }
     }
+	// if (isFpgaConnected()) {
+	// 	try {
+	// 		for (DatagramSocket socketFpga : fpgaSockets) {
+	// 			socketFpga.close();
+	// 		}
+	// 	} catch (Exception e) {
+	// 	}
+	// }
   }
 
   public boolean isConnected() {
@@ -403,4 +439,74 @@ public class Connection implements Closeable {
     }
     return true;
   }
+
+  public String getFpgaBulkReply(int fpga_idx) {
+    logger.debug("fpga_idx = {}", fpga_idx);
+    final byte[] result = getFpgaBinaryBulkReply(fpga_idx);
+    if (null != result) {
+      return SafeEncoder.encode(result);
+    } else {
+      return null;
+    }
+  }
+
+  public byte[] getFpgaBinaryBulkReply(int fpga_idx) {
+    logger.debug("fpga_idx = {}", fpga_idx);
+    byte[] ret_fpga = (byte[]) readFpgaProtocol(fpga_idx);
+    if (ret_fpga != null) {
+	  byte keyLen = ByteBuffer.wrap(ret_fpga,3,1).get();
+	  keyLen = keyLen < 16 ? 16 : keyLen;
+	  if (ByteBuffer.wrap(ret_fpga,0,3).equals(ByteBuffer.wrap(FpgaProtocol.FPGA_GET_SUCCESS)))
+	  {
+		byte[] get_result = Arrays.copyOfRange(ret_fpga, 22, 6 + keyLen + ByteBuffer.wrap(ret_fpga,4,2).getShort());
+		// logger.debug("fpga get value = {}", SafeEncoder.encode(get_result));
+		return get_result;
+	  } else if (ByteBuffer.wrap(ret_fpga,0,3).equals(ByteBuffer.wrap(FpgaProtocol.FPGA_GET_FAILURE)))
+	  {
+		return null;
+	  } else if (ByteBuffer.wrap(ret_fpga,0,3).equals(ByteBuffer.wrap(FpgaProtocol.FPGA_SET_SUCCESS)))
+	  {
+		return FpgaProtocol.FPGA_SET_SUCCESS;
+	  } else {
+		  // TODO: new commands
+		  return null;
+	  }
+    } else {
+      logger.debug("fpga reply = null");
+    }
+    return ret_fpga;
+  }
+
+  protected Object readFpgaProtocol(int fpga_idx) {
+    return FpgaProtocol.read(fpgaSockets.get(fpga_idx), fpga_idx);
+  }
+
+  public boolean isFpgaConnected(int idx) {
+    return fpgaSockets != null && idx < fpgaSockets.size() && fpgaSockets.get(idx) != null;
+  }
+
+  public boolean isFpgaConnected() {
+    return fpgaSockets != null && fpgaSockets.size() == FpgaProtocol.FPGA_ADDRS.size();
+  }
+
+  public void sendFpgaCommand(int fpga_idx, final ProtocolCommand cmd, final String... args) {
+    final byte[][] bargs = new byte[args.length][];
+    for (int i = 0; i < args.length; i++) {
+      bargs[i] = SafeEncoder.encode(args[i]);
+    }
+    sendFpgaCommand(fpga_idx, cmd, bargs);
+  }
+
+  public void sendFpgaCommand(int fpga_idx, final ProtocolCommand cmd) {
+    sendFpgaCommand(fpga_idx, cmd, (byte[])null);
+  }
+
+  public void sendFpgaCommand(int fpga_idx, final ProtocolCommand cmd, final byte[]... args) {
+    // try {
+      FpgaProtocol.sendFpgaCommand(fpgaSockets.get(fpga_idx), fpga_idx, cmd, args);
+    // } catch (IOException ex) {
+
+    // }
+  }
+
 }
